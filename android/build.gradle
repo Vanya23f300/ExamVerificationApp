@@ -12,9 +12,36 @@ buildscript {
         mavenCentral()
     }
     dependencies {
-        classpath("com.android.tools.build:gradle")
-        classpath("com.facebook.react:react-native-gradle-plugin")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin")
+        classpath("com.android.tools.build:gradle:8.9.2")
+        classpath("com.facebook.react:react-native-gradle-plugin:0.80.1")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:${kotlinVersion}")
+    }
+}
+
+// Add global dependency resolution for all projects
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url "https://www.jitpack.io" }
+        maven { url "https://maven.google.com" }
+    }
+    
+    // Global configuration to resolve react-native-camera conflicts
+    configurations.all {
+        resolutionStrategy {
+            // Force specific versions to resolve conflicts
+            force 'androidx.annotation:annotation:1.3.0'
+            force 'androidx.core:core:1.8.0'
+            force 'androidx.appcompat:appcompat:1.4.2'
+            
+            // Handle react-native-camera variant selection
+            eachDependency { details ->
+                if (details.requested.group == 'org.webkit' && details.requested.name == 'android-jsc') {
+                    details.useVersion '+'
+                }
+            }
+        }
     }
 }
 

@@ -84,7 +84,31 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+        multiDexEnabled true
     }
+    
+    // Update resolution strategy for React Native 0.80 compatibility
+    configurations.all {
+        resolutionStrategy {
+            force 'androidx.core:core:1.8.0'
+            force 'androidx.core:core-ktx:1.8.0'
+            force 'androidx.appcompat:appcompat:1.6.1'
+            force 'androidx.activity:activity:1.8.2'
+            force 'androidx.fragment:fragment:1.6.2'
+        }
+    }
+    
+    // Add packagingOptions to handle duplicate files
+    packagingOptions {
+        pickFirst '**/libc++_shared.so'
+        pickFirst '**/libjsc.so'
+        exclude 'META-INF/DEPENDENCIES'
+        exclude 'META-INF/LICENSE'
+        exclude 'META-INF/LICENSE.txt'
+        exclude 'META-INF/NOTICE'
+        exclude 'META-INF/NOTICE.txt'
+    }
+    
     signingConfigs {
         debug {
             storeFile file('debug.keystore')
@@ -96,6 +120,8 @@ android {
     buildTypes {
         debug {
             signingConfig signingConfigs.debug
+            debuggable true
+            minifyEnabled false
         }
         release {
             // Caution! In production, you need to generate your own keystore file.
@@ -110,7 +136,13 @@ android {
 dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
-
+    
+    // Add explicit React Native dependencies for version compatibility
+    implementation("com.facebook.react:react-native:0.80.1")
+    implementation("androidx.appcompat:appcompat:1.6.1")
+    implementation("androidx.activity:activity:1.8.2")
+    implementation("androidx.fragment:fragment:1.6.2")
+    
     if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")
     } else {

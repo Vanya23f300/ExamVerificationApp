@@ -1,5 +1,17 @@
 import { Client } from 'pg';
+import bcrypt from 'bcrypt';
+import crypto from 'crypto';
 import { Candidate, Verifier, VerificationResult } from '../types';
+
+// Security configuration
+const SECURITY_CONFIG = {
+  SALT_ROUNDS: 12,
+  SESSION_TIMEOUT: 30 * 60 * 1000, // 30 minutes
+  MAX_LOGIN_ATTEMPTS: 3,
+  LOCKOUT_DURATION: 15 * 60 * 1000, // 15 minutes
+  ENCRYPTION_ALGORITHM: 'aes-256-gcm',
+  JWT_SECRET: process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex')
+};
 
 class DatabaseService {
   private client: Client | null = null;
@@ -12,6 +24,7 @@ class DatabaseService {
       database: process.env.DB_NAME || 'exam_verification_db',
       password: process.env.DB_PASSWORD || 'exam_password',
       port: parseInt(process.env.DB_PORT || '5432'),
+      ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
     });
   }
 
@@ -81,7 +94,11 @@ class DatabaseService {
         assigned_date DATE,
         assigned_shift VARCHAR(100),
         assigned_centre VARCHAR(255),
-        password VARCHAR(255) NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        password VARCHAR(255), -- Keep for backward compatibility during migration
+        failed_attempts INTEGER DEFAULT 0,
+        last_failed_attempt TIMESTAMP,
+        last_successful_login TIMESTAMP,
         is_active BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )`,
@@ -107,6 +124,13 @@ class DatabaseService {
         details JSONB,
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         ip_address INET
+      )`,
+      `CREATE TABLE IF NOT EXISTS security_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_type VARCHAR(100) NOT NULL,
+        details JSONB,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        severity VARCHAR(10) CHECK (severity IN ('LOW', 'MEDIUM', 'HIGH', 'CRITICAL'))
       )`
     ];
 
@@ -129,7 +153,9 @@ class DatabaseService {
       'CREATE INDEX IF NOT EXISTS idx_candidates_centre ON candidates(centre)',
       'CREATE INDEX IF NOT EXISTS idx_verification_results_timestamp ON verification_results(timestamp)',
       'CREATE INDEX IF NOT EXISTS idx_verification_results_status ON verification_results(final_status)',
-      'CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp)'
+      'CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp)',
+      'CREATE INDEX IF NOT EXISTS idx_security_logs_timestamp ON security_logs(timestamp)',
+      'CREATE INDEX IF NOT EXISTS idx_security_logs_severity ON security_logs(severity)'
     ];
 
     try {
@@ -170,16 +196,23 @@ class DatabaseService {
         ON CONFLICT (shift_code) DO NOTHING
       `);
 
-      // Insert sample verifiers
-      await this.client.query(`
-        INSERT INTO verifiers (id, name, assigned_date, assigned_shift, assigned_centre, password) VALUES
-        ('V001', 'John Doe', '2025-07-21', 'S1', 'Delhi Centre 1', 'password123'),
-        ('V002', 'Jane Smith', '2025-07-21', 'S2', 'Mumbai Centre 1', 'password123'),
-        ('ADMIN', 'System Admin', '2025-07-21', 'S1', 'Delhi Centre 1', 'admin123')
-        ON CONFLICT (id) DO NOTHING
-      `);
+      // Insert sample verifiers (passwords will be hashed)
+      const sampleVerifiers = [
+        { id: 'V001', name: 'John Doe', date: '2025-07-21', shift: 'S1', centre: 'Delhi Centre 1', password: 'password123' },
+        { id: 'V002', name: 'Jane Smith', date: '2025-07-21', shift: 'S2', centre: 'Mumbai Centre 1', password: 'password123' },
+        { id: 'ADMIN', name: 'System Admin', date: '2025-07-21', shift: 'S1', centre: 'Delhi Centre 1', password: 'admin123' }
+      ];
 
-      // Insert sample candidates with biometric templates
+      for (const verifier of sampleVerifiers) {
+        const passwordHash = await bcrypt.hash(verifier.password, SECURITY_CONFIG.SALT_ROUNDS);
+        await this.client.query(
+          `INSERT INTO verifiers (id, name, assigned_date, assigned_shift, assigned_centre, password_hash, password) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id) DO NOTHING`,
+          [verifier.id, verifier.name, verifier.date, verifier.shift, verifier.centre, passwordHash, verifier.password]
+        );
+      }
+
+      // Insert sample candidates with encrypted biometric data
       const sampleCandidates = [
         {
           rollNumber: 'JEE2024001',
@@ -191,9 +224,9 @@ class DatabaseService {
           email: 'rahul.sharma@example.com',
           fatherName: 'Suresh Sharma',
           photo: 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAv/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAAAAX/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCdABmX/9k=',
-          fingerprint1: 'fp1_template_base64_data_rahul',
-          fingerprint2: 'fp2_template_base64_data_rahul',
-          retinaData: 'retina_template_base64_data_rahul'
+          fingerprint1: this.encryptBiometricData('fp1_template_base64_data_rahul'),
+          fingerprint2: this.encryptBiometricData('fp2_template_base64_data_rahul'),
+          retinaData: this.encryptBiometricData('retina_template_base64_data_rahul')
         },
         {
           rollNumber: 'JEE2024002',
@@ -205,9 +238,9 @@ class DatabaseService {
           email: 'priya.patel@example.com',
           fatherName: 'Raj Patel',
           photo: 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAv/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAAAAX/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCdABmX/9k=',
-          fingerprint1: 'fp1_template_base64_data_priya',
-          fingerprint2: 'fp2_template_base64_data_priya',
-          retinaData: 'retina_template_base64_data_priya'
+          fingerprint1: this.encryptBiometricData('fp1_template_base64_data_priya'),
+          fingerprint2: this.encryptBiometricData('fp2_template_base64_data_priya'),
+          retinaData: this.encryptBiometricData('retina_template_base64_data_priya')
         },
         {
           rollNumber: 'JEE2024003',
@@ -218,9 +251,9 @@ class DatabaseService {
           phone: '9876543212',
           email: 'amit.singh@example.com',
           fatherName: 'Ravi Singh',
-          fingerprint1: 'fp1_template_base64_data_amit',
-          fingerprint2: 'fp2_template_base64_data_amit',
-          retinaData: 'retina_template_base64_data_amit'
+          fingerprint1: this.encryptBiometricData('fp1_template_base64_data_amit'),
+          fingerprint2: this.encryptBiometricData('fp2_template_base64_data_amit'),
+          retinaData: this.encryptBiometricData('retina_template_base64_data_amit')
         }
       ];
 
@@ -229,25 +262,54 @@ class DatabaseService {
           `INSERT INTO candidates (roll_number, name, exam_date, shift, centre, photo, fingerprint1, fingerprint2, retina_data, phone, email, father_name) 
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (roll_number) DO NOTHING`,
           [
-            candidate.rollNumber,
-            candidate.name,
-            candidate.examDate,
-            candidate.shift,
-            candidate.centre,
-            candidate.photo || null,
-            candidate.fingerprint1,
-            candidate.fingerprint2,
-            candidate.retinaData,
-            candidate.phone,
-            candidate.email,
-            candidate.fatherName
+            candidate.rollNumber, candidate.name, candidate.examDate, candidate.shift, candidate.centre,
+            candidate.photo || null, candidate.fingerprint1, candidate.fingerprint2, candidate.retinaData,
+            candidate.phone, candidate.email, candidate.fatherName
           ]
         );
       }
 
-      console.log('Sample data inserted successfully');
+      console.log('Sample data inserted successfully with encrypted biometric data');
     } catch (error) {
       console.error('Error inserting sample data:', error);
+    }
+  }
+
+  // Enhanced data encryption for biometric data
+  encryptBiometricData(data: string): string {
+    try {
+      const key = crypto.scryptSync(SECURITY_CONFIG.JWT_SECRET, 'salt', 32);
+      const iv = crypto.randomBytes(16);
+      const cipher = crypto.createCipheriv(SECURITY_CONFIG.ENCRYPTION_ALGORITHM, key, iv);
+      
+      let encrypted = cipher.update(data, 'utf8', 'hex');
+      encrypted += cipher.final('hex');
+      
+      return `${iv.toString('hex')}:${encrypted}`;
+    } catch (error) {
+      console.error('Encryption error:', error);
+      return data; // Fallback to unencrypted data
+    }
+  }
+
+  decryptBiometricData(encryptedData: string): string {
+    try {
+      if (!encryptedData.includes(':')) {
+        return encryptedData; // Return as-is if not encrypted
+      }
+      
+      const [ivHex, encrypted] = encryptedData.split(':');
+      const iv = Buffer.from(ivHex, 'hex');
+      const key = crypto.scryptSync(SECURITY_CONFIG.JWT_SECRET, 'salt', 32);
+      const decipher = crypto.createDecipheriv(SECURITY_CONFIG.ENCRYPTION_ALGORITHM, key, iv);
+      
+      let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+      decrypted += decipher.final('utf8');
+      
+      return decrypted;
+    } catch (error) {
+      console.error('Decryption error:', error);
+      return encryptedData; // Fallback to encrypted data
     }
   }
 
@@ -257,9 +319,23 @@ class DatabaseService {
     }
 
     try {
+      // Input validation and sanitization
+      const sanitizedRollNumber = rollNumber.trim().toUpperCase();
+      
+      // Validate roll number format
+      if (!/^[A-Z0-9]{6,15}$/.test(sanitizedRollNumber)) {
+        throw new Error('Invalid roll number format');
+      }
+      
+      // Log data access for audit trail
+      await this.logSecurityEvent('DATA_ACCESS', { 
+        rollNumber: sanitizedRollNumber, 
+        action: 'CANDIDATE_LOOKUP' 
+      });
+
       const result = await this.client.query(
         'SELECT * FROM candidates WHERE roll_number = $1',
-        [rollNumber]
+        [sanitizedRollNumber]
       );
 
       if (result.rows.length > 0) {
@@ -271,9 +347,9 @@ class DatabaseService {
           shift: row.shift,
           centre: row.centre,
           photo: row.photo,
-          fingerprint1: row.fingerprint1,
-          fingerprint2: row.fingerprint2,
-          retinaData: row.retina_data,
+          fingerprint1: row.fingerprint1 ? this.decryptBiometricData(row.fingerprint1) : undefined,
+          fingerprint2: row.fingerprint2 ? this.decryptBiometricData(row.fingerprint2) : undefined,
+          retinaData: row.retina_data ? this.decryptBiometricData(row.retina_data) : undefined,
           phone: row.phone,
           email: row.email,
           fatherName: row.father_name
@@ -282,36 +358,182 @@ class DatabaseService {
       return null;
     } catch (error) {
       console.error('Get candidate error:', error);
+      await this.logSecurityEvent('DATA_ACCESS_ERROR', { 
+        rollNumber, 
+        error: String(error) 
+      });
       throw new Error(`Failed to fetch candidate: ${error}`);
     }
   }
 
-  async verifyLogin(id: string, password: string): Promise<Verifier | null> {
+  // Enhanced login with security measures
+  async verifyLogin(id: string, password: string, ipAddress?: string): Promise<{
+    success: boolean;
+    verifier?: Verifier;
+    error?: string;
+    accountLocked?: boolean;
+  }> {
     if (!this.client || !this.isConnected) {
       throw new Error('Database not connected');
     }
 
     try {
+      // Input validation
+      if (!id || !password) {
+        await this.logSecurityEvent('LOGIN_INVALID_INPUT', { id, ipAddress });
+        return { success: false, error: 'Invalid credentials' };
+      }
+
+      // Check for account lockout
+      const lockoutCheck = await this.client.query(
+        `SELECT failed_attempts, last_failed_attempt 
+         FROM verifiers 
+         WHERE id = $1`,
+        [id]
+      );
+
+      if (lockoutCheck.rows.length > 0) {
+        const { failed_attempts, last_failed_attempt } = lockoutCheck.rows[0];
+        
+        if (failed_attempts >= SECURITY_CONFIG.MAX_LOGIN_ATTEMPTS) {
+          const lockoutTime = new Date(last_failed_attempt).getTime() + SECURITY_CONFIG.LOCKOUT_DURATION;
+          if (Date.now() < lockoutTime) {
+            await this.logSecurityEvent('ACCOUNT_LOCKED_ATTEMPT', { id, ipAddress });
+            return { success: false, accountLocked: true, error: 'Account temporarily locked due to multiple failed attempts' };
+          }
+        }
+      }
+
+      // Get user with hashed password
       const result = await this.client.query(
-        'SELECT * FROM verifiers WHERE id = $1 AND password = $2 AND is_active = TRUE',
-        [id, password]
+        `SELECT id, name, assigned_date, assigned_shift, assigned_centre, 
+                password_hash, is_active, failed_attempts
+         FROM verifiers 
+         WHERE id = $1 AND is_active = TRUE`,
+        [id]
+      );
+
+      if (result.rows.length === 0) {
+        await this.logSecurityEvent('LOGIN_INVALID_USER', { id, ipAddress });
+        return { success: false, error: 'Invalid credentials' };
+      }
+
+      const user = result.rows[0];
+      
+      // Verify password
+      const passwordMatch = await bcrypt.compare(password, user.password_hash);
+      
+      if (!passwordMatch) {
+        // Increment failed attempts
+        await this.client.query(
+          `UPDATE verifiers 
+           SET failed_attempts = failed_attempts + 1, last_failed_attempt = CURRENT_TIMESTAMP
+           WHERE id = $1`,
+          [id]
+        );
+        
+        await this.logSecurityEvent('LOGIN_FAILED', { id, ipAddress, attempts: user.failed_attempts + 1 });
+        return { success: false, error: 'Invalid credentials' };
+      }
+
+      // Reset failed attempts on successful login
+      await this.client.query(
+        `UPDATE verifiers 
+         SET failed_attempts = 0, last_successful_login = CURRENT_TIMESTAMP
+         WHERE id = $1`,
+        [id]
+      );
+
+      await this.logSecurityEvent('LOGIN_SUCCESS', { id, ipAddress });
+
+      return {
+        success: true,
+        verifier: {
+          id: user.id,
+          name: user.name,
+          assignedDate: user.assigned_date,
+          assignedShift: user.assigned_shift,
+          assignedCentre: user.assigned_centre,
+          password: '' // Never return password
+        }
+      };
+
+    } catch (error) {
+      console.error('Login verification error:', error);
+      await this.logSecurityEvent('LOGIN_ERROR', { id, ipAddress, error: String(error) });
+      throw new Error(`Login failed: ${error}`);
+    }
+  }
+
+  // Security event logging
+  async logSecurityEvent(event: string, details: any): Promise<void> {
+    try {
+      await this.client?.query(
+        `INSERT INTO security_logs (event_type, details, timestamp, severity)
+         VALUES ($1, $2, CURRENT_TIMESTAMP, $3)`,
+        [event, JSON.stringify(details), this.getEventSeverity(event)]
+      );
+    } catch (error) {
+      console.error('Failed to log security event:', error);
+    }
+  }
+
+  private getEventSeverity(event: string): 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL' {
+    const criticalEvents = ['ACCOUNT_LOCKED_ATTEMPT', 'SQL_INJECTION_ATTEMPT', 'UNAUTHORIZED_ACCESS'];
+    const highEvents = ['LOGIN_FAILED', 'PERMISSION_DENIED', 'DATA_BREACH_ATTEMPT'];
+    const mediumEvents = ['LOGIN_SUCCESS', 'DATA_ACCESS', 'VERIFICATION_COMPLETED'];
+    
+    if (criticalEvents.includes(event)) return 'CRITICAL';
+    if (highEvents.includes(event)) return 'HIGH';
+    if (mediumEvents.includes(event)) return 'MEDIUM';
+    return 'LOW';
+  }
+
+  async getCandidateByRollNumber(rollNumber: string): Promise<Candidate | null> {
+    if (!this.client || !this.isConnected) {
+      throw new Error('Database not connected');
+    }
+
+    try {
+      // Input validation and sanitization
+      const sanitizedRollNumber = rollNumber.trim().toUpperCase();
+      
+      // Log data access for audit trail
+      await this.logSecurityEvent('DATA_ACCESS', { 
+        rollNumber: sanitizedRollNumber, 
+        action: 'CANDIDATE_LOOKUP' 
+      });
+
+      const result = await this.client.query(
+        'SELECT * FROM candidates WHERE roll_number = $1',
+        [sanitizedRollNumber]
       );
 
       if (result.rows.length > 0) {
         const row = result.rows[0];
         return {
-          id: row.id,
+          rollNumber: row.roll_number,
           name: row.name,
-          assignedDate: row.assigned_date,
-          assignedShift: row.assigned_shift,
-          assignedCentre: row.assigned_centre,
-          password: row.password
+          examDate: row.exam_date,
+          shift: row.shift,
+          centre: row.centre,
+          photo: row.photo,
+          fingerprint1: row.fingerprint1 ? this.decryptBiometricData(row.fingerprint1) : undefined,
+          fingerprint2: row.fingerprint2 ? this.decryptBiometricData(row.fingerprint2) : undefined,
+          retinaData: row.retina_data ? this.decryptBiometricData(row.retina_data) : undefined,
+          phone: row.phone,
+          email: row.email,
+          fatherName: row.father_name
         };
       }
       return null;
     } catch (error) {
-      console.error('Login verification error:', error);
-      throw new Error(`Login failed: ${error}`);
+      console.error('Get candidate error:', error);
+      await this.logSecurityEvent('DATA_ACCESS_ERROR', { 
+        rollNumber, 
+        error: String(error) 
+      });
+      throw new Error(`Failed to fetch candidate: ${error}`);
     }
   }
 
@@ -377,6 +599,38 @@ class DatabaseService {
     } catch (error) {
       console.error('Insert candidate error:', error);
       throw new Error(`Failed to insert candidate: ${error}`);
+    }
+  }
+
+  // Insert verifier with password hashing
+  async insertVerifier(verifier: Verifier): Promise<boolean> {
+    if (!this.client || !this.isConnected) {
+      throw new Error('Database not connected');
+    }
+
+    try {
+      // Hash the password
+      const passwordHash = await bcrypt.hash(verifier.password, SECURITY_CONFIG.SALT_ROUNDS);
+      
+      await this.client.query(
+        `INSERT INTO verifiers (id, name, assigned_date, assigned_shift, assigned_centre, password_hash, password) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (id) DO UPDATE SET
+         name = $2, assigned_date = $3, assigned_shift = $4, assigned_centre = $5, password_hash = $6`,
+        [
+          verifier.id,
+          verifier.name,
+          verifier.assignedDate,
+          verifier.assignedShift,
+          verifier.assignedCentre,
+          passwordHash,
+          verifier.password // Keep for backward compatibility during migration
+        ]
+      );
+      return true;
+    } catch (error) {
+      console.error('Insert verifier error:', error);
+      throw new Error(`Failed to insert verifier: ${error}`);
     }
   }
 
